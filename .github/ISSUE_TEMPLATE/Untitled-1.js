@@ -1,0 +1,384 @@
+/**
+ * OTEL AI SATIŞ VE NİYET ANALİZ MOTORU (PRO SÜRÜM)
+  * Claude 3.5 Sonnet + PayTR API + Webhook Mimarisi
+   */
+
+   const express = require('express');
+   const axios = require('axios');
+   const crypto = require('crypto');
+
+   const app = express();
+   app.use(express.json());
+
+   // --- 1. AYARLAR & GİZLİ ANAHTARLAR ---
+   const CONFIG = {
+      ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY || "YOUR_CLAUDE_API_KEY",
+        CHATWOOT_API_TOKEN: process.env.CHATWOOT_API_TOKEN || "YOUR_CHATWOOT_TOKEN",
+          CHATWOOT_URL: process.env.CHATWOOT_URL || "https://app.chatwoot.com",
+            PAYTR: {
+                    MERCHANT_ID: process.env.PAYTR_MERCHANT_ID || "YOUR_MERCHANT_ID",
+                        MERCHANT_KEY: process.env.PAYTR_MERCHANT_KEY || "YOUR_MERCHANT_KEY",
+                            MERCHANT_SALT: process.env.PAYTR_MERCHANT_SALT || "YOUR_MERCHANT_SALT",
+            }
+   };
+
+   // --- 2. DİNAMİK PAYTR ÖDEME LİNKİ ÜRETİCİSİ ---
+   async function createPayTRLink(customer, amount, bookingDetails) {
+      try {
+            const merchant_oid = "REZ-" + Date.now();
+                const user_basket = JSON.stringify([
+                          [`Otel Rezervasyonu Kapora - ${bookingDetails.roomType}`, `${amount}`, 1]
+                ]);
+                    
+                        // PayTR Token Güvenlik İmzası
+                            const hashStr = `${CONFIG.PAYTR.MERCHANT_ID}${customer.ip}${merchant_oid}${customer.email}${amount}${user_basket}10${CONFIG.PAYTR.MERCHANT_SALT}`;
+                                const paytr_token = crypto.createHmac('sha256', CONFIG.PAYTR.MERCHANT_KEY).update(hashStr).digest('base64');
+
+                                    // Gerçek PayTR API İsteği
+                                        const response = await axios.post('https://www.paytr.com/odeme/api/get-token', {
+                                                  merchant_id: CONFIG.PAYTR.MERCHANT_ID,
+                                                        user_ip: customer.ip || '127.0.0.1',
+                                                              merchant_oid: merchant_oid,
+                                                                    email: customer.email || 'musteri@otel.com',
+                                                                          payment_amount: amount * 100, // Kuruş cinsinden (Örn: 700 TL = 70000)
+                                                                                paytr_token: paytr_token,
+                                                                                      user_basket: user_basket,
+                                                                                            debug_on: 1,
+                                                                                                  no_interest: 0,
+                                                                                                        currency: 'TL'
+                                        });
+
+                                            if (response.data.status === 'success') {
+                                                      return `https://www.paytr.com/odeme/guvenli/${response.data.token}`;
+                                            } else {
+                                                      console.error('PayTR Hata:', response.data.reason);
+                                                            return `https://www.paytr.com/link/demo-fallback-link`; // Hata durumunda yedek link
+                                            }
+      } catch (error) {
+            console.error('PayTR Bağlantı Hatası:', error.message);
+                return `https://www.paytr.com/link/demo-fallback-link`;
+      }
+   }
+
+   // --- 3. CLAUDE 3.5 NİYET ANALİZİ VE YANIT MOTORU ---
+   async function processMessageWithClaude(userMessage, conversationHistory) {
+      const systemPrompt = `
+        Sen lüks bir otelin resepsiyonunda çalışan, son derece kibar, ikna kabiliyeti yüksek bir Satış Uzmanısın.
+          
+            GÖREVİN:
+              Müşterinin attığı son mesajı analiz et ve 3 durumdan birini seç:
+                
+                  1. NİYET = 'INFO' (Skor 0-40): Müşteri otel olanakları, konum vb. soruyor.
+                       -> Yanıt: Soruyu detaylı yanıtla, fiyat verme, darlama.
+                            
+                              2. NİYET = 'PRICE' (Skor 41-75): Müşteri fiyat, oda müsaitliği veya tarih soruyor.
+                                   -> Yanıt: Deluxe Oda gecelik 3.500 TL (Kahvaltı Dahil) bilgisini ver. "Odayı sizin adınıza ayırtmamı ister misiniz?" diye sor. LİNK ATMA!
+                                        
+                                          3. NİYET = 'BOOKING' (Skor 76-100): Müşteri "Yer ayıralım", "Rezerve et", "Ödeme yapayım", "Link at" diyor.
+                                               -> Yanıt: Müşteriyi tebrik et, odayı 15 dakikalığına kilitlediğini söyle ve kapora tutarının (700 TL) linkini ekleyeceğini belirt.
+
+                                                 Şu anki müşteri mesajı: "${userMessage}"
+                                                   `;
+
+                                                     try {
+                                                            const response = await axios.post(
+                                                                      'https://api.anthropic.com/v1/messages',
+                                                                            {
+                                                                                        model: 'claude-3-5-sonnet-20241022',
+                                                                                                max_tokens: 1000,
+                                                                                                        messages: [{ role: 'user', content: systemPrompt }]
+                                                                            },
+                                                                                  {
+                                                                                            headers: {
+                                                                                                          'x-api-key': CONFIG.ANTHROPIC_API_KEY,
+                                                                                                                    'anthropic-version': '2023-06-01',
+                                                                                                                              'content-type': 'application/json'
+                                                                                            }
+                                                                                  }
+                                                            );
+
+                                                                return response.data.content[0].text;
+                                                     } catch (error) {
+                                                            // API Key yoksa veya hata verirse yedek kural tabanlı motor çalışır
+                                                                return fallbackRuleEngine(userMessage);
+                                                     }
+   }
+
+   // YEDEK MUSAİTLİK VE NİYET MOTORU (API Bağlantısı Olmadığı Durumlar İçin)
+   function fallbackRuleEngine(message) {
+      const msg = message.toLowerCase();
+
+        if (msg.includes('rezerve') || msg.includes('oduyorum') || msg.includes('tutuyorum') || msg.includes('link') || msg.includes('almak')) {
+                return { intent: 'BOOKING', text: "Harika karar! Deluxe odayı adınıza 15 dakika kilitledim. %20 kapora tutarınız (700 TL) için güvenli ödeme bağlantınız aşağıdadır:" };
+        } else if (msg.includes('fiyat') || msg.includes('ücret') || msg.includes('kaç para') || msg.includes('boş yer')) {
+                return { intent: 'PRICE', text: "Seçtiğiniz tarihler için Deluxe odamızın gecelik fiyatı 3.500 TL'dir (Serpme Kahvaltı Dahil). Yerinizi ayırtmamı ister misiniz?" };
+        } else {
+                return { intent: 'INFO', text: "Tesisimizde açık/kapalı havuz, SPA, ücretsiz Wi-Fi ve 7/24 resepsiyon hizmeti mevcuttur. Konaklamak istediğiniz tarihleri iletirseniz yardımcı olabilirim." };
+        }
+   }
+
+   // --- 4. CHATWOOT WEBHOOK DİNLENEN ANA NOKTA ---
+   app.post('/webhook', async (req, res) => {
+      try {
+            const { event, content, conversation, message_type } = req.body;
+
+                // Sadece gelen müşteri mesajlarında tetiklen
+                    if (event === 'message_created' && message_type === 'incoming') {
+                              const customerId = conversation.meta.sender.id;
+                                    const accountId = req.body.account.id;
+                                          const conversationId = conversation.id;
+
+                                                console.log(`[Yeni Müşteri Mesajı]: ${content}`);
+
+                                                      // 1. Claude veya Kural Motoru Analiz Eder
+                                                            const analysis = fallbackRuleEngine(content); 
+                                                                  let finalReply = analysis.text;
+
+                                                                        // 2. Eğer Niyet "BOOKING" İse Anında PayTR Linki Oluşturulur ve Eklenir
+                                                                              if (analysis.intent === 'BOOKING') {
+                                                                                        const paytrLink = await createPayTRLink(
+                                                                                                      { email: 'musteri@gmail.com', ip: '178.240.1.1' },
+                                                                                                                700, // 700 TL Kapora
+                                                                                                                          { roomType: 'Deluxe Suite' }
+                                                                                        );
+                                                                                                finalReply += `\n\n💳 Güvenli Ödeme Linki (PayTR): ${paytrLink}\n\nÖdemeniz tamamlandığı an konfirme belgeniz WhatsApp'a düşecektir.`;
+                                                                              }
+
+                                                                                    // 3. Yanıtı Chatwoot API Üzerinden Müşterinin WhatsApp'ına Geri At
+                                                                                          await axios.post(
+                                                                                                    `${CONFIG.CHATWOOT_URL}/api/v1/accounts/${accountId}/conversations/${conversationId}/messages`,
+                                                                                                            { content: finalReply, message_type: 'outgoing' },
+                                                                                                                    { headers: { 'api_access_token': CONFIG.CHATWOOT_API_TOKEN } }
+                                                                                          );
+
+                                                                                                console.log(`[Ajan Müşteriye Cevap Verdi]`);
+                    }
+
+                        res.status(200).json({ status: 'success' });
+      } catch (error) {
+            console.error('Webhook Hatası:', error.message);
+                res.status(500).json({ status: 'error' });
+      }
+   });
+
+   // --- 5. SUNUCUYU BAŞLAT ---
+   const PORT = process.env.PORT || 3000;
+   app.listen(PORT, () => {
+      console.log(`🚀 Otel AI Satış Motoru ${PORT} portunda başarıyla başlatıldı!`);
+   });
+   /**
+    * OTEL AI SATIŞ VE NİYET ANALİZ MOTORU (PRO SÜRÜM)
+     * Claude 3.5 Sonnet + PayTR API + Webhook Mimarisi
+      */
+
+      const express = require('express');
+      const axios = require('axios');
+      const crypto = require('crypto');
+
+      const app = express();
+      app.use(express.json());
+
+      // --- 1. 
+      };
+
+      // --- 2. DİNAMİK PAYTR ÖDEME LİNKİ ÜRETİCİSİ ---
+      async function createPayTRLink(customer, amount, bookingDetails) {
+          try {
+                const merchant_oid = "REZ-" + Date.now();
+                    const user_basket = JSON.stringify([
+                              [`Otel Rezervasyonu Kapora - ${bookingDetails.roomType}`, `${amount}`, 1]
+                    ]);
+                        
+                            // PayTR Token Güvenlik İmzası
+                                const hashStr = `${CONFIG.PAYTR.MERCHANT_ID}${customer.ip}${merchant_oid}${customer.email}${amount}${user_basket}10${CONFIG.PAYTR.MERCHANT_SALT}`;
+                                    const paytr_token = crypto.createHmac('sha256', CONFIG.PAYTR.MERCHANT_KEY).update(hashStr).digest('base64');
+
+                                        // Gerçek PayTR API İsteği
+                                            const response = await axios.post('https://www.paytr.com/odeme/api/get-token', {
+                                                      merchant_id: CONFIG.PAYTR.MERCHANT_ID,
+                                                            user_ip: customer.ip || '127.0.0.1',
+                                                                  merchant_oid: merchant_oid,
+                                                                        email: customer.email || 'musteri@otel.com',
+                                                                              payment_amount: amount * 100, // Kuruş cinsinden (Örn: 700 TL = 70000)
+                                                                                    paytr_token: paytr_token,
+                                                                                          user_basket: user_basket,
+                                                                                                debug_on: 1,
+                                                                                                      no_interest: 0,
+                                                                                                            currency: 'TL'
+                                            });
+
+                                                if (response.data.status === 'success') {
+                                                          return `https://www.paytr.com/odeme/guvenli/${response.data.token}`;
+                                                } else {
+                                                          console.error('PayTR Hata:', response.data.reason);
+                                                                return `https://www.paytr.com/link/demo-fallback-link`; // Hata durumunda yedek link
+                                                }
+          } catch (error) {
+                console.error('PayTR Bağlantı Hatası:', error.message);
+                    return `https://www.paytr.com/link/demo-fallback-link`;
+          }
+      }
+
+      // --- 3. CLAUDE 3.5 NİYET ANALİZİ VE YANIT MOTORU ---
+      async function processMessageWithClaude(userMessage, conversationHistory) {
+          const systemPrompt = `
+            Sen lüks bir otelin resepsiyonunda çalışan, son derece kibar, ikna kabiliyeti yüksek bir Satış Uzmanısın.
+              
+                GÖREVİN:
+                  Müşterinin attığı son mesajı analiz et ve 3 durumdan birini seç:
+                    
+                      1. NİYET = 'INFO' (Skor 0-40): Müşteri otel olanakları, konum vb. soruyor.
+                           -> Yanıt: Soruyu detaylı yanıtla, fiyat verme, darlama.
+                                
+                                  2. NİYET = 'PRICE' (Skor 41-75): Müşteri fiyat, oda müsaitliği veya tarih soruyor.
+                                       -> Yanıt: Deluxe Oda gecelik 3.500 TL (Kahvaltı Dahil) bilgisini ver. "Odayı sizin adınıza ayırtmamı ister misiniz?" diye sor. LİNK ATMA!
+                                            
+                                              3. NİYET = 'BOOKING' (Skor 76-100): Müşteri "Yer ayıralım", "Rezerve et", "Ödeme yapayım", "Link at" diyor.
+                                                   -> Yanıt: Müşteriyi tebrik et, odayı 15 dakikalığına kilitlediğini söyle ve kapora tutarının (700 TL) linkini ekleyeceğini belirt.
+
+                                                     Şu anki müşteri mesajı: "${userMessage}"
+                                                       `;
+
+                                                         try {
+                                                                const response = await axios.post(
+                                                                          'https://api.anthropic.com/v1/messages',
+                                                                                {
+                                                                                            model: 'claude-3-5-sonnet-20241022',
+                                                                                                    max_tokens: 1000,
+                                                                                                            messages: [{ role: 'user', content: systemPrompt }]
+                                                                                },
+                                                                                      {
+                                                                                                headers: {
+                                                                                                              'x-api-key': CONFIG.ANTHROPIC_API_KEY,
+                                                                                                                        'anthropic-version': '2023-06-01',
+                                                                                                                                  'content-type': 'application/json'
+                                                                                                }
+                                                                                      }
+                                                                );
+
+                                                                    return response.data.content[0].text;
+                                                         } catch (error) {
+                                                                // API Key yoksa veya hata verirse yedek kural tabanlı motor çalışır
+                                                                    return fallbackRuleEngine(userMessage);
+                                                         }
+      }
+
+      // YEDEK MUSAİTLİK VE NİYET MOTORU (API Bağlantısı Olmadığı Durumlar İçin)
+      function fallbackRuleEngine(message) {
+          const msg = message.toLowerCase();
+
+            if (msg.includes('rezerve') || msg.includes('oduyorum') || msg.includes('tutuyorum') || msg.includes('link') || msg.includes('almak')) {
+                    return { intent: 'BOOKING', text: "Harika karar! Deluxe odayı adınıza 15 dakika kilitledim. %20 kapora tutarınız (700 TL) için güvenli ödeme bağlantınız aşağıdadır:" };
+            } else if (msg.includes('fiyat') || msg.includes('ücret') || msg.includes('kaç para') || msg.includes('boş yer')) {
+                    return { intent: 'PRICE', text: "Seçtiğiniz tarihler için Deluxe odamızın gecelik fiyatı 3.500 TL'dir (Serpme Kahvaltı Dahil). Yerinizi ayırtmamı ister misiniz?" };
+            } else {
+                    return { intent: 'INFO', text: "Tesisimizde açık/kapalı havuz, SPA, ücretsiz Wi-Fi ve 7/24 resepsiyon hizmeti mevcuttur. Konaklamak istediğiniz tarihleri iletirseniz yardımcı olabilirim." };
+            }
+      }
+
+      // --- 4. CHATWOOT WEBHOOK DİNLENEN ANA NOKTA ---
+      app.post('/webhook', async (req, res) => {
+          try {
+                const { event, content, conversation, message_type } = req.body;
+
+                    // Sadece gelen müşteri mesajlarında tetiklen
+                        if (event === 'message_created' && message_type === 'incoming') {
+                                  const customerId = conversation.meta.sender.id;
+                                        const accountId = req.body.account.id;
+                                              const conversationId = conversation.id;
+
+                                                    console.log(`[Yeni Müşteri Mesajı]: ${content}`);
+
+                                                          // 1. Claude veya Kural Motoru Analiz Eder
+                                                                const analysis = fallbackRuleEngine(content); 
+                                                                      let finalReply = analysis.text;
+
+                                                                            // 2. Eğer Niyet "BOOKING" İse Anında PayTR Linki Oluşturulur ve Eklenir
+                                                                                  if (analysis.intent === 'BOOKING') {
+                                                                                            const paytrLink = await createPayTRLink(
+                                                                                                          { email: 'musteri@gmail.com', ip: '178.240.1.1' },
+                                                                                                                    700, // 700 TL Kapora
+                                                                                                                              { roomType: 'Deluxe Suite' }
+                                                                                            );
+                                                                                                    finalReply += `\n\n💳 Güvenli Ödeme Linki (PayTR): ${paytrLink}\n\nÖdemeniz tamamlandığı an konfirme belgeniz WhatsApp'a düşecektir.`;
+                                                                                  }
+
+                                                                                        // 3. Yanıtı Chatwoot API Üzerinden Müşterinin WhatsApp'ına Geri At
+                                                                                              await axios.post(
+                                                                                                        `${CONFIG.CHATWOOT_URL}/api/v1/accounts/${accountId}/conversations/${conversationId}/messages`,
+                                                                                                                { content: finalReply, message_type: 'outgoing' },
+                                                                                                                        { headers: { 'api_access_token': CONFIG.CHATWOOT_API_TOKEN } }
+                                                                                              );
+
+                                                                                                    console.log(`[Ajan Müşteriye Cevap Verdi]`);
+                        }
+
+                            res.status(200).json({ status: 'success' });
+          } catch (error) {
+                console.error('Webhook Hatası:', error.message);
+                    res.status(500).json({ status: 'error' });
+          }
+      });
+
+      // --- 5. SUNUCUYU BAŞLAT ---
+      const PORT = process.env.PORT || 3000;
+      app.listen(PORT, () => {
+          console.log(`🚀 Otel AI Satış Motoru ${PORT} portunda başarıyla başlatıldı!`);
+      });
+
+      })
+          }
+                                                                                              )
+                                                                                            )
+                                                                                  }
+                        }
+          }
+      })
+            }
+            }
+            }
+      }
+                                                         }
+                                                                                                }
+                                                                                      }
+                                                                                }
+                                                                )
+                                                         }
+      }
+          }
+                                                }
+                                                }
+                                            })
+                    ])
+          }
+      }
+                }
+      }
+   })
+      }
+                                                                                          )
+                                                                                        )
+                                                                              }
+                    }
+      }
+   })
+        }
+        }
+        }
+   }
+                                                     }
+                                                                                            }
+                                                                                  }
+                                                                            }
+                                                            )
+                                                     }
+   }
+      }
+                                            }
+                                            }
+                                        })
+                ])
+      }
+   }
+            }
+   }
